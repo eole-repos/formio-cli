@@ -7,7 +7,7 @@ jobs:
       PJ_NAME: 'formio-cli'
       FORK_URL: 'https://github.com/eole-repos'
       ORIG_URL: 'https://github.com/formio'
-  steps:
+    steps:
       - add_ssh_keys: 
           fingerprints:
                   - 'f6:50:5a:17:74:12:c5:e6:48:5d:95:02:43:5b:2a:9b'
