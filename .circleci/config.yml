@@ -3,14 +3,16 @@ jobs:
   build:
     machine: true
     environment:
+      GIT_USER: 'eole-developer'
       PJ_NAME: 'formio-cli'
-      FORK_URL: 'https://github.com/formio'
-      ORIG_URL: 'https://github.com/eole-repos'
-    steps:
+      FORK_URL: 'https://github.com/eole-repos'
+      ORIG_URL: 'https://github.com/formio'
+  steps:
       - add_ssh_keys: 
           fingerprints:
                   - 'f6:50:5a:17:74:12:c5:e6:48:5d:95:02:43:5b:2a:9b'
       - checkout
+      - run: git config user.name $GIT_USER
       - run: git clone $FORK_URL/$PJ_NAME
         #- run: echo "git clone $FORK_URL/$PJ_NAME"
       - run: cd  $PJ_NAME
