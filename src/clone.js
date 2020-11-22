@@ -6,6 +6,8 @@ const fs = require('fs');
 const MongoClient = mongodb.MongoClient;
 
 module.exports = function(source, destination, options) {
+  // If the source and destination are the same, then we need to create new records.
+  const createNew = (source === destination);
   const mongoConfig = (type) => {
     const config = {
       useNewUrlParser: true,
@@ -13,7 +15,12 @@ module.exports = function(source, destination, options) {
     };
     if (options[`${type}Ca`]) {
       const caFile = options[`${type}Ca`];
+      config.tls = true;
       config.tlsCAFile = `${process.cwd()}/${caFile}`;
+      if (options[`${type}Cert`]) {
+        const certFile = options[`${type}Cert`];
+        config.tlsCertificateKeyFile = `${process.cwd()}/${certFile}`;
+      }
       config.tlsAllowInvalidHostnames = true;
     }
     return config;
@@ -60,6 +67,7 @@ module.exports = function(source, destination, options) {
         tags: destDb.collection('tags')
       };
 
+      // Iterate through each document within a cursor.
       const eachDocument = function(cursor, each, done) {
         let current = null;
         async.whilst(
@@ -77,22 +85,14 @@ module.exports = function(source, destination, options) {
           done);
       };
 
+      // Upsert all documents within the collection provided a query.
       const upsertAll = function(collection, query, beforeEach, afterEach, done) {
-        const cursor = src[collection].find(query);
-        eachDocument(cursor, (current, nextItem) => {
-          let cloned = current;
-          try {
-            cloned = JSON.parse(JSON.stringify(current));
-          }
-          catch (err) {
-            console.error(`Error copying ${collection} ${current._id}`, err);
-            return nextItem();
-          }
+        eachDocument(src[collection].find(query), (current, nextItem) => {
+          let cloned = _.cloneDeep(current);
           if (beforeEach) {
             beforeEach(cloned);
           }
-          delete current._id;
-          dest[collection].insertOne(cloned, (err, copy) => {
+          const onCreated = (err, copy) => {
             if (err) {
               console.error(`Error creating ${collection} ${current._id}`, err);
               return nextItem();
@@ -104,8 +104,65 @@ module.exports = function(source, destination, options) {
             else {
               nextItem();
             }
-          });
+          };
+
+          if (createNew) {
+            delete current._id;
+            dest[collection].insertOne(cloned, (err, inserted) => {
+              if (err) {
+                return onCreated(err);
+              }
+              dest[collection].findOne({_id: inserted.insertedId}, onCreated);
+            });
+          }
+          else {
+            dest[collection].replaceOne({_id: current._id}, cloned, {upsert: true}, (err) => {
+              if (err) {
+                return onCreated(err);
+              }
+              dest[collection].findOne({_id: current._id}, onCreated);
+            });
+          }
         }, done);
+      };
+
+      const getQuery = function(query) {
+        let newQuery = _.cloneDeep(query);
+        if (!options.all) {
+          newQuery.deleted = {$eq: null};
+        }
+        return newQuery;
+      };
+
+      const srcProjectQuery = function(query) {
+        const sourceProject = options.project || options.srcProject;
+        if (sourceProject) {
+          if (sourceProject.indexOf(',') === -1) {
+            query._id = mongodb.ObjectID(sourceProject);
+          }
+          else {
+            query._id = {$in: sourceProject.split(',').map((id) => mongodb.ObjectID(id))};
+          }
+        }
+        return query;
+      };
+
+      // Alter query to add deletedAfter and createdAfter filters.
+      const getItemQuery = function(query) {
+        let newQuery = _.cloneDeep(query);
+        if (options.deletedAfter) {
+          newQuery['$or'] = [
+            {deleted: {$eq: null}},
+            {deleted: {$gt: parseInt(options.deletedAfter, 10)}}
+          ];
+        }
+        else {
+          newQuery = getQuery(newQuery);
+        }
+        if (options.createdAfter) {
+          newQuery.created = {$gt: parseInt(options.createdAfter, 10)};
+        }
+        return newQuery;
       };
 
       if (options.submissionsOnly) {
@@ -118,11 +175,10 @@ module.exports = function(source, destination, options) {
           return console.log(`You must provide a source project. --src-project=<project_id>`);
         }
 
-        const dstFormCursor = dest.forms.find({
-          project: mongodb.ObjectID(options.dstProject),
-          deleted: {$eq: null}
-        });
-        eachDocument(dstFormCursor, (dstForm, nextForm) => {
+        // Iterate through all forms.
+        eachDocument(dest.forms.find(getQuery({
+          project: mongodb.ObjectID(options.dstProject)
+        })), (dstForm, nextForm) => {
           src.forms.findOne({
             project: mongodb.ObjectID(options.srcProject),
             name: dstForm.name
@@ -138,19 +194,18 @@ module.exports = function(source, destination, options) {
             let deletePromise = Promise.resolve();
             if (options.deleteSubmissions) {
               console.log(`Deleting submissions from ${dstForm.title}`);
-              deletePromise = dest.submissions.deleteMany({
+              deletePromise = dest.submissions.deleteMany(getItemQuery({
                 project: dstForm.project,
                 form: dstForm._id
-              });
+              }));
             }
 
             deletePromise.then(() => {
               process.stdout.write(`Cloning submissions from form ${srcForm.title}: `);
-              upsertAll('submissions', {
+              upsertAll('submissions', getItemQuery({
                 form: srcForm._id,
-                project: srcForm.project,
-                deleted: {$eq: null}
-              }, (submission) => {
+                project: srcForm.project
+              }), (submission) => {
                 submission.form = dstForm._id;
                 submission.project = dstForm.project;
               }, null,() => nextForm());
@@ -162,71 +217,71 @@ module.exports = function(source, destination, options) {
         });
       }
       else {
-        let itemQuery = {};
-        let formItemQuery = {};
-        let projectQuery = {};
-        const sourceProject = options.project || options.srcProject;
-        if (sourceProject) {
-          projectQuery = {_id: mongodb.ObjectID(sourceProject)};
-        }
-        else if (options.deletedAfter) {
-          projectQuery = {
-            $or: [
-              {deleted: {$eq: null}},
-              {deleted: {$gt: parseInt(options.deletedAfter, 10)}}
-            ]
-          };
-          itemQuery = {...projectQuery};
-          formItemQuery = {...projectQuery};
-        }
-        else if (!options.all) {
-          projectQuery = {deleted: {$eq: null}};
-          itemQuery = {...projectQuery};
-          formItemQuery = {...projectQuery};
-        }
-
-        upsertAll('projects', projectQuery, null, (project, clonedProject, nextProject) => {
-          // Do not include the formio project
-          if (project.name === 'formio') {
-            return nextProject();
+        const itemQuery = getQuery({});
+        process.stdout.write("\n");
+        process.stdout.write(`Fetching formio project owner.`);
+        dest.projects.findOne({name: 'formio'}, (err, formioProject) => {
+          if (err) {
+            return console.log(`Error loading formio project: ${err.message}`);
           }
-          itemQuery.project = project._id;
-          process.stdout.write("\n");
-          process.stdout.write(`Project ${project._id}: `);
-          upsertAll('forms', itemQuery, (form) => {
-            form.project = clonedProject._id;
-          }, (form, clonedForm, nextForm) => {
-            formItemQuery.form = form._id;
+          const formioOwner = formioProject ? formioProject.owner : null;
+          upsertAll('projects', srcProjectQuery({...itemQuery}), (project) => {
+            if (formioOwner) {
+              project.owner = formioOwner;
+            }
+          }, (project, clonedProject, nextProject) => {
+            // Do not include the formio project
+            if (project.name === 'formio') {
+              return nextProject();
+            }
+            itemQuery.project = project._id;
             process.stdout.write("\n");
-            process.stdout.write(` - Form ${form._id}: `);
-            process.stdout.write("\n");
-            process.stdout.write(`   - Submissions: : `);
-            upsertAll('submissions', formItemQuery, (sub) => {
-              sub.form = clonedForm._id;
-              sub.project = clonedProject._id;
-            }, null, () => {
+            process.stdout.write(`Cloning project ${project.title} (${project._id}): `);
+            upsertAll('forms', itemQuery, (form) => {
+              form.project = clonedProject._id;
+            }, (form, clonedForm, nextForm) => {
+              itemQuery.form = form._id;
               process.stdout.write("\n");
-              process.stdout.write(`   - Actions: : `);
-              upsertAll('actions', formItemQuery, (action) => {
-                action.form = clonedForm._id;
-              }, null, () => nextForm());
-            });
-          }, () => {
-            upsertAll('roles', itemQuery, (role) => {
-              role.project = clonedProject._id;
-            }, null, () => {
-              upsertAll('tags', itemQuery, (tag) => {
-                tag.project = clonedProject._id;
+              process.stdout.write(` - Cloning form ${form.title} (${form._id}): `);
+              process.stdout.write("\n");
+              process.stdout.write(`   - Submissions: : `);
+              upsertAll('submissions', getItemQuery(itemQuery), (sub) => {
+                sub.form = clonedForm._id;
+                sub.project = clonedProject._id;
               }, null, () => {
-                upsertAll('formrevisions', itemQuery, (revision) => {
-                  revision.project = clonedProject._id;
-                }, null, () => nextProject());
+                process.stdout.write("\n");
+                process.stdout.write(`   - Actions: : `);
+                delete itemQuery.project;
+                upsertAll('actions', getItemQuery(itemQuery), (action) => {
+                  action.form = clonedForm._id;
+                }, null, () => nextForm());
+              });
+            }, () => {
+              itemQuery.project = project._id;
+              delete itemQuery.form;
+              upsertAll('roles', itemQuery, (role) => {
+                process.stdout.write("\n");
+                process.stdout.write(` - Cloning role ${role.title} (${role._id}): `);
+                role.project = clonedProject._id;
+              }, null, () => {
+                upsertAll('tags', getItemQuery(itemQuery), (tag) => {
+                  process.stdout.write("\n");
+                  process.stdout.write(` - Cloning tag ${tag.tag} (${tag._id}): `);
+                  tag.project = clonedProject._id;
+                }, null, () => {
+                  upsertAll('formrevisions', getItemQuery(itemQuery), (revision) => {
+                    process.stdout.write("\n");
+                    process.stdout.write(` - Cloning revision ${revision.name} v${revision._vid} (${revision._id}): `);
+                    process.stdout.write("\n");
+                    revision.project = clonedProject._id;
+                  }, null, () => nextProject());
+                });
               });
             });
+          }, () => {
+            console.log('');
+            console.log('DONE!');
           });
-        }, () => {
-          console.log('');
-          console.log('DONE!');
         });
       }
     });
